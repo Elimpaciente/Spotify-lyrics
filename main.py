@@ -1,13 +1,14 @@
-from fastapi import FastAPI, Query
+# main.py
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
+import requests
+import spotipy
 import hashlib
 import hmac
 import math
 import re
 from urllib.parse import urlparse
-from typing import Optional
 
 app = FastAPI(title="Spotify Lyrics API")
 
@@ -47,13 +48,9 @@ DEFAULT_SP_DC = "AQAO1j7bPbFcbVh5TbQmwmTd_XFckJhbOipaA0t2BZpViASzI6Qrk1Ty0WviN1K
 
 class TOTP:
     def __init__(self) -> None:
-        self.secret, self.version = None, None
-        
-    async def initialize(self):
-        self.secret, self.version = await self.get_secret_version()
+        self.secret, self.version = self.get_secret_version()
         self.period = 30
         self.digits = 6
-        return self
 
     def generate(self, timestamp: int) -> str:
         counter = math.floor(timestamp / 1000 / self.period)
@@ -72,9 +69,12 @@ class TOTP:
 
         return str(binary % (10**self.digits)).zfill(self.digits)
     
-    async def get_secret_version(self) -> tuple:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            req = await client.get("https://raw.githubusercontent.com/Thereallo1026/spotify-secrets/refs/heads/main/secrets/secrets.json")
+    def get_secret_version(self) -> tuple:
+        try:
+            req = requests.get(
+                "https://raw.githubusercontent.com/Thereallo1026/spotify-secrets/refs/heads/main/secrets/secrets.json",
+                timeout=10
+            )
             if req.status_code != 200:
                 raise ValueError("Failed to fetch TOTP secret and version.")
             data = req.json()[-1]
@@ -82,27 +82,23 @@ class TOTP:
             transformed = [val ^ ((i % 33) + 9) for i, val in enumerate(ascii_codes)]
             secret_key = "".join(str(num) for num in transformed)
             return bytes(secret_key, 'utf-8'), data['version']
+        except Exception as e:
+            raise ValueError(f"Failed to fetch TOTP secret: {str(e)}")
 
 class SpotifyLyricsAPI:
     def __init__(self, sp_dc: str = DEFAULT_SP_DC) -> None:
-        self.sp_dc = sp_dc
-        self.token = None
-        self.totp = None
+        self.session = requests.Session()
+        self.session.cookies.set('sp_dc', sp_dc)
+        self.session.headers.update(HEADERS)
+        self.totp = TOTP()
+        self._login()
+        self.sp = spotipy.Spotify(auth=self.token)
 
-    async def initialize(self):
-        self.totp = await TOTP().initialize()
-        await self._login()
-        return self
-
-    async def _login(self):
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            client.cookies.set('sp_dc', self.sp_dc)
-            client.headers.update(HEADERS)
-            
-            server_time_response = await client.get(SERVER_TIME_URL)
+    def _login(self):
+        try:
+            server_time_response = self.session.get(SERVER_TIME_URL, timeout=10)
             server_time = 1e3 * server_time_response.json()["serverTime"]
             totp = self.totp.generate(timestamp=server_time)
-            
             params = {
                 "reason": "init",
                 "productType": "web-player",
@@ -110,10 +106,12 @@ class SpotifyLyricsAPI:
                 "totpVer": str(self.totp.version),
                 "ts": str(server_time),
             }
-            
-            req = await client.get(TOKEN_URL, params=params)
+            req = self.session.get(TOKEN_URL, params=params, timeout=10)
             token = req.json()
             self.token = token['accessToken']
+            self.session.headers['authorization'] = f"Bearer {self.token}"
+        except Exception as e:
+            raise ValueError(f"Authentication failed: {str(e)}")
 
     def extract_track_id(self, url: str) -> str:
         if not url:
@@ -130,30 +128,26 @@ class SpotifyLyricsAPI:
         
         raise ValueError("Invalid Spotify track URL")
 
-    async def get_track_details(self, track_id: str) -> dict:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            client.headers.update({
-                'authorization': f'Bearer {self.token}'
-            })
-            response = await client.get(f'https://api.spotify.com/v1/tracks/{track_id}')
-            if response.status_code != 200:
-                raise ValueError("Track not found")
-            return response.json()
+    def get_track_details(self, track_id: str) -> dict:
+        try:
+            track = self.sp.track(track_id)
+            return track
+        except Exception as e:
+            raise ValueError(f"Track not found: {str(e)}")
 
-    async def get_lyrics(self, track_id: str) -> dict:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            client.cookies.set('sp_dc', self.sp_dc)
-            client.headers.update(HEADERS)
-            client.headers.update({'authorization': f'Bearer {self.token}'})
-            
+    def get_lyrics(self, track_id: str) -> dict:
+        try:
             params = 'format=json&market=from_token'
-            req = await client.get(
+            req = self.session.get(
                 f'https://spclient.wg.spotify.com/color-lyrics/v2/track/{track_id}',
-                params=params
+                params=params,
+                timeout=10
             )
             if req.status_code != 200:
                 return None
             return req.json()
+        except Exception as e:
+            return None
 
     def get_combined_lyrics(self, lines: list) -> str:
         if not lines:
@@ -174,7 +168,7 @@ async def root():
     )
 
 @app.get("/lyrics")
-async def get_lyrics(url: str = ""):
+async def get_lyrics_endpoint(url: str = ""):
     if not url or url.strip() == "":
         return JSONResponse(
             content={
@@ -188,11 +182,11 @@ async def get_lyrics(url: str = ""):
         )
     
     try:
-        spotify = await SpotifyLyricsAPI().initialize()
+        spotify = SpotifyLyricsAPI()
         track_id = spotify.extract_track_id(url)
         
-        track_details = await spotify.get_track_details(track_id)
-        lyrics_data = await spotify.get_lyrics(track_id)
+        track_details = spotify.get_track_details(track_id)
+        lyrics_data = spotify.get_lyrics(track_id)
         
         song_title = track_details['name']
         artist_name = track_details['artists'][0]['name']
@@ -201,18 +195,16 @@ async def get_lyrics(url: str = ""):
             lyrics_data['lyrics']['lines'] if lyrics_data and 'lyrics' in lyrics_data else []
         )
         
-        response_content = {
-            "status_code": 200,
-            "message": "Lyrics retrieved successfully",
-            "title": song_title,
-            "artist": artist_name,
-            "lyrics": lyrics_text,
-            "developer": "El Impaciente",
-            "telegram_channel": "https://t.me/Apisimpacientes"
-        }
-        
         return JSONResponse(
-            content=response_content,
+            content={
+                "status_code": 200,
+                "message": "Lyrics retrieved successfully",
+                "title": song_title,
+                "artist": artist_name,
+                "lyrics": lyrics_text,
+                "developer": "El Impaciente",
+                "telegram_channel": "https://t.me/Apisimpacientes"
+            },
             status_code=200
         )
         
@@ -236,3 +228,24 @@ async def get_lyrics(url: str = ""):
             },
             status_code=400
         )
+
+# requirements.txt
+fastapi
+requests
+spotipy
+
+# vercel.json
+{
+  "builds": [
+    {
+      "src": "main.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "main.py"
+    }
+  ]
+}
